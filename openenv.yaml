@@ -1,0 +1,23 @@
+name: ShadowWatch-v0
+version: "1.0.0"
+domain: defence
+
+tasks:
+  - id: single_target_clear
+    difficulty: easy
+    max_steps: 40
+
+  - id: multi_threat_gps_denied
+    difficulty: medium
+    max_steps: 80
+
+  - id: swarm_electronic_warfare
+    difficulty: hard
+    max_steps: 120
+
+reward: partial_progress
+
+endpoints:
+  reset: /reset
+  step: /step
+  state: /state
