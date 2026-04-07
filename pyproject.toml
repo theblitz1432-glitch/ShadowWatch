@@ -15,19 +15,20 @@ dependencies = [
     "requests",
     "python-dotenv",
     "openai",
+    "openenv-core>=0.2.0",
 ]
 
 [project.scripts]
-shadowwatch-server = "api.main:app"
+shadowwatch = "server.app:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["api*", "env*", "baseline*"]
+include = ["api*", "env*", "baseline*", "server*"]
 
 [tool.openenv]
 name = "shadowwatch-v0"
 version = "0.1.0"
-entry_point = "api.main:app"
+entry_point = "server.app:app"
 server = "uvicorn"
 host = "0.0.0.0"
 port = 7860
