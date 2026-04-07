@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "shadowwatch"
+version = "0.1.0"
+description = "ShadowWatch-v0 — Autonomous Drone Patrol & Threat Detection"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "requests",
+    "python-dotenv",
+    "openai",
+]
+
+[project.scripts]
+shadowwatch-server = "api.main:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["api*", "env*", "baseline*"]
+
+[tool.openenv]
+name = "shadowwatch-v0"
+version = "0.1.0"
+entry_point = "api.main:app"
+server = "uvicorn"
+host = "0.0.0.0"
+port = 7860
+tasks = [
+    "single_target_clear",
+    "multi_threat_gps_denied",
+    "swarm_electronic_warfare",
+]
+inference_script = "inference.py"
