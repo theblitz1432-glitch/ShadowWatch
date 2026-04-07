@@ -21,9 +21,11 @@ from openai import OpenAI
 
 load_dotenv()
 
-API_KEY         = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "")
-API_BASE_URL    = os.getenv("API_BASE_URL", "https://api.groq.com/openai/v1")
-MODEL_NAME      = os.getenv("MODEL_NAME",   "llama-3.3-70b-versatile")
+# Use injected proxy credentials — required by the hackathon validator
+API_KEY      = os.environ.get("API_KEY", os.getenv("HF_TOKEN", ""))
+API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
+MODEL_NAME   = os.environ.get("MODEL_NAME", "gpt-4o-mini")
+
 SHADOWWATCH_URL = os.getenv("SHADOWWATCH_API_URL", "http://localhost:7860")
 BENCHMARK       = "shadowwatch-v0"
 
@@ -52,6 +54,46 @@ def log_step(step, action, reward, done, error=None):
 def log_end(success, steps, score, rewards):
     print(f"[END]   success={str(success).lower()} steps={steps} "
           f"score={score:.3f} rewards={','.join(f'{r:.2f}' for r in rewards)}", flush=True)
+
+
+# ── LLM helper ────────────────────────────────────────────────────────────────
+
+def ask_llm(client: OpenAI, obs: dict, context: str) -> Optional[str]:
+    """Ask the LLM for an action suggestion. Returns action string or None."""
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            max_tokens=20,
+            temperature=0.2,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a tactical drone patrol agent. "
+                        "Given sensor readings and context, choose ONE action from: "
+                        "move_north, move_south, move_east, move_west, "
+                        "hover_scan, send_alert, return_to_base. "
+                        "Reply with ONLY the action string, nothing else."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Context: {context}\n"
+                        f"Sensor readings: {obs.get('sensor_readings', {})}\n"
+                        f"GPS: {obs.get('gps_status')}, Battery: {obs.get('battery', 1.0):.2f}\n"
+                        f"Confirmed threats: {obs.get('threats_confirmed', 0)}, "
+                        f"Alerts sent: {obs.get('alerts_sent', 0)}\n"
+                        "Choose action:"
+                    ),
+                },
+            ],
+        )
+        action = (response.choices[0].message.content or "").strip().lower().strip(".,!?\"'")
+        return action if action in (MOVE_ACTIONS + ["hover_scan", "send_alert", "return_to_base"]) else None
+    except Exception as e:
+        print(f"[LLM]   error: {e}", flush=True)
+        return None
 
 
 # ── Observation helpers ────────────────────────────────────────────────────────
@@ -135,7 +177,7 @@ def print_ground_truth(url):
 
 # ── Main episode runner ────────────────────────────────────────────────────────
 
-def run_episode(task_id: str, client) -> float:
+def run_episode(task_id: str, client: OpenAI) -> float:
     cfg       = TASK_CONFIG[task_id]
     grid_size = cfg["grid"]
     max_steps = cfg["max_steps"]
@@ -159,18 +201,12 @@ def run_episode(task_id: str, client) -> float:
     # Drone rotation (task 3)
     active_drone = 1
 
-    # ── FIX 2: decoy cooldown ──────────────────────────────────────────────
-    decoy_cooldown_remaining = 0   # steps left where scanning is suppressed
+    decoy_cooldown_remaining = 0
 
-    # ── FIX 3: post-alert cooldown ─────────────────────────────────────────
-    # After sending an alert the drone is still near the confirmed target, so
-    # signal stays high and chasing re-enables immediately, causing the N/S
-    # oscillation loop. Force snake-walk for POST_ALERT_COOLDOWN steps after
-    # each alert so the drone moves away before hunting the next signal.
     POST_ALERT_COOLDOWN      = 8
     post_alert_cooldown_rem  = 0
-    CLEARED_RADIUS           = 4   # cells around a confirmed+alerted threat
-    cleared_zones: list      = []  # list of (row, col) where alerts were sent
+    CLEARED_RADIUS           = 4
+    cleared_zones: list      = []
 
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
@@ -193,14 +229,11 @@ def run_episode(task_id: str, client) -> float:
 
             visited.add(pos)
 
-            # Countdown timers
             if decoy_cooldown_remaining > 0:
                 decoy_cooldown_remaining -= 1
             if post_alert_cooldown_rem > 0:
                 post_alert_cooldown_rem -= 1
 
-            # Re-enable chasing only when post-alert cooldown has cleared,
-            # preventing immediate re-lock on the just-confirmed target.
             if max_sig > best_signal:
                 best_signal = max_sig; best_pos = pos
             in_cleared = any(
@@ -210,7 +243,6 @@ def run_episode(task_id: str, client) -> float:
             if max_sig > 0.1 and not chasing and post_alert_cooldown_rem == 0 and not in_cleared:
                 chasing = True
 
-            # Convenience flag: may we scan this step?
             scan_allowed = (decoy_cooldown_remaining == 0) and (pos not in scanned)
 
             print(f"[DBG]   step={step} d={active_drone} pos={pos} "
@@ -236,27 +268,29 @@ def run_episode(task_id: str, client) -> float:
                 active_drone = nxt
                 print(f"[DBG]   → SWITCH → drone {nxt}", flush=True)
 
-            # P4: GPS spoofed — position unreliable, use signal only
+            # P4: GPS spoofed — consult LLM for guidance
             elif gps == "spoofed":
-                # FIX 1+2: scan first if signal strong AND cooldown clear
                 if max_sig > 0.6 and scan_allowed:
                     action = "hover_scan"
                     scanned.add(pos)
                     print(f"[DBG]   → SPOOFED+STRONG → scan", flush=True)
-                elif max_sig > prev_signal:
-                    action = last_move
-                    print(f"[DBG]   → SPOOFED+RISING → {action}", flush=True)
                 else:
-                    action = random.choice(["move_south", "move_east", "move_south", "move_west"])
-                    print(f"[DBG]   → SPOOFED+PROBE → {action}", flush=True)
+                    llm_action = ask_llm(client, obs, f"GPS spoofed, signal={max_sig:.2f}")
+                    if llm_action:
+                        action = llm_action
+                        print(f"[DBG]   → SPOOFED+LLM → {action}", flush=True)
+                    elif max_sig > prev_signal:
+                        action = last_move
+                        print(f"[DBG]   → SPOOFED+RISING → {action}", flush=True)
+                    else:
+                        action = random.choice(["move_south", "move_east", "move_south", "move_west"])
+                        print(f"[DBG]   → SPOOFED+PROBE → {action}", flush=True)
 
-            # P5: Chasing a signal (normal GPS or jammed)
+            # P5: Chasing a signal
             elif chasing and max_sig > 0.1:
-                # Abort chase if we've drifted back into an already-cleared zone
                 if any(abs(pos[0]-c[0]) + abs(pos[1]-c[1]) <= CLEARED_RADIUS for c in cleared_zones):
                     chasing = False
                     best_signal = 0.0; best_pos = None
-                # FIX 1: scan BEFORE checking camera when signal is strong
                 if max_sig > 0.6 and scan_allowed:
                     action = "hover_scan"
                     scanned.add(pos)
@@ -267,11 +301,17 @@ def run_episode(task_id: str, client) -> float:
                         action = cam
                         print(f"[DBG]   → CHASE+CAMERA → {action}", flush=True)
                     elif max_sig >= prev_signal:
-                        # Signal rising or stable — keep heading same direction
-                        cands = [m for m in MOVE_ACTIONS
-                                 if next_pos(pos, m, grid_size) not in visited]
-                        action = cands[0] if cands else last_move
-                        print(f"[DBG]   → CHASE+RISING → {action}", flush=True)
+                        # Ask LLM when signal is rising but camera gives no direction
+                        llm_action = ask_llm(client, obs,
+                            f"Chasing signal={max_sig:.2f}, prev={prev_signal:.2f}, pos={pos}")
+                        if llm_action and llm_action in MOVE_ACTIONS:
+                            action = llm_action
+                            print(f"[DBG]   → CHASE+LLM → {action}", flush=True)
+                        else:
+                            cands = [m for m in MOVE_ACTIONS
+                                     if next_pos(pos, m, grid_size) not in visited]
+                            action = cands[0] if cands else last_move
+                            print(f"[DBG]   → CHASE+RISING → {action}", flush=True)
                     elif best_pos and best_pos != pos:
                         action = move_toward(pos, best_pos)
                         print(f"[DBG]   → CHASE+BACKTRACK to {best_pos} → {action}", flush=True)
@@ -279,7 +319,7 @@ def run_episode(task_id: str, client) -> float:
                         chasing = False
                         action = random.choice(MOVE_ACTIONS)
 
-            # P6: GPS jammed — trust signal, continue snake
+            # P6: GPS jammed
             elif gps == "jammed":
                 if max_sig > 0.6 and scan_allowed:
                     action = "hover_scan"
@@ -300,7 +340,7 @@ def run_episode(task_id: str, client) -> float:
                     action = cands[0] if cands else "move_south"
                     print(f"[DBG]   → JAMMED+MOVE → {action}", flush=True)
 
-            # P7: Normal snake — move only, scan only on strong signal
+            # P7: Normal snake exploration
             else:
                 while snake_idx < len(snake) and snake[snake_idx] in visited:
                     snake_idx += 1
@@ -344,20 +384,16 @@ def run_episode(task_id: str, client) -> float:
                 for sr in info["scan_results"]:
                     status = sr['status'].upper()
                     print(f"[SCAN]  {status} {sr['threat_type']} at {sr['position']}", flush=True)
-                    # FIX 2: decoy cooldown — stop scanning for a while
                     if "DECOY" in status:
                         decoy_cooldown_remaining = DECOY_COOLDOWN
-                        # Also reset chasing so we move away and search elsewhere
                         chasing = False; best_signal = 0.0; best_pos = None
-                        print(f"[DBG]   Decoy detected — scan cooldown {DECOY_COOLDOWN} steps, resuming search", flush=True)
+                        print(f"[DBG]   Decoy detected — scan cooldown {DECOY_COOLDOWN} steps", flush=True)
                     elif "CONFIRMED" in status or "DETECTED" in status:
-                        # Real threat found — reset so we hunt the next one
                         chasing = False; best_signal = 0.0; best_pos = None
 
             if info.get("alerts_sent"):
                 for a in info["alerts_sent"]:
                     print(f"[ALERT] ✓ {a['threat_type'].upper()} at {a['position']}", flush=True)
-                # FIX 3+4: record cleared zone AND start cooldown
                 cleared_zones.append(pos)
                 chasing = False; best_signal = 0.0; best_pos = None
                 post_alert_cooldown_rem = POST_ALERT_COOLDOWN
@@ -369,7 +405,7 @@ def run_episode(task_id: str, client) -> float:
                 new_bat = obs.get("battery", 1.0)
                 print(f"[INFO]  Base. bat→{new_bat:.2f}", flush=True)
                 chasing = False; best_signal = 0.0; best_pos = None
-                post_alert_cooldown_rem = 0  # base reset clears cooldown too
+                post_alert_cooldown_rem = 0
 
             rewards.append(reward)
             steps_taken = step
@@ -391,7 +427,12 @@ def run_episode(task_id: str, client) -> float:
 
 
 def main():
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    # Initialize OpenAI client using injected proxy credentials
+    client = OpenAI(
+        base_url=API_BASE_URL,
+        api_key=API_KEY,
+    )
+
     tasks  = ["single_target_clear", "multi_threat_gps_denied", "swarm_electronic_warfare"]
     scores = {}
 
