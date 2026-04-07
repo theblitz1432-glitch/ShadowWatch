@@ -3,7 +3,7 @@ ShadowWatch-v0 — FastAPI server
 Exposes the OpenEnv interface via HTTP endpoints.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from env.shadow_env import ShadowWatchEnv
 from env.models import Observation, State, StepResult
@@ -18,10 +18,6 @@ app = FastAPI(
 env: ShadowWatchEnv = ShadowWatchEnv("single_target_clear")
 
 VALID_TASKS = ["single_target_clear", "multi_threat_gps_denied", "swarm_electronic_warfare"]
-
-
-class ResetRequest(BaseModel):
-    task_id: str = "single_target_clear"
 
 
 class StepRequest(BaseModel):
@@ -39,14 +35,29 @@ def root():
 
 
 @app.post("/reset", response_model=Observation)
-def reset(body: ResetRequest):
-    """Reset the environment for the given task. Returns initial Observation."""
-    if body.task_id not in VALID_TASKS:
+async def reset(request: Request):
+    """
+    Reset the environment for the given task. Returns initial Observation.
+    Body is optional — defaults to 'single_target_clear' if not provided.
+    Accepts: {} | {"task_id": "..."} | no body at all.
+    """
+    task_id = "single_target_clear"
+
+    try:
+        body = await request.json()
+        if isinstance(body, dict) and "task_id" in body:
+            task_id = body["task_id"]
+    except Exception:
+        # No body, empty body, or non-JSON — use default task
+        pass
+
+    if task_id not in VALID_TASKS:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid task_id. Must be one of: {VALID_TASKS}"
+            detail=f"Invalid task_id '{task_id}'. Must be one of: {VALID_TASKS}"
         )
-    obs = env.reset(body.task_id)
+
+    obs = env.reset(task_id)
     return obs
 
 
